@@ -1,0 +1,386 @@
+---
+title: "RNA-seq Differential Gene Expression with DESeq2"
+author: "Mery Touceda-Suárez"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+subtitle: UCD Bioinformatics Summer Course — Week 2, Day 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 8,
+  fig.height = 5
+)
+knitr::opts_knit$set(root.dir = "~/Documents/GitHub/ucd_bioinformaticscourse_2026/scripts/day4/DESeq2/")
+```
+
+---
+
+# Overview
+
+In this session we will take a **raw gene count matrix** from an RNA-seq experiment and walk through a complete differential gene expression (DGE) analysis using **DESeq2**. By the end you should be able to:
+
+- Understand what a count matrix is and why we need special statistical methods for it
+- Run a DESeq2 analysis from start to finish
+- Produce and interpret a PCA plot, MA plot, volcano plot, and heatmap
+- Extract lists of differentially expressed genes (DEGs)
+
+## The experiment
+
+We have RNA-seq data from cells sampled at **three time points**:
+
+| Label | Meaning         |
+|-------|-----------------|
+| D0    | Day 0 (baseline)|
+| D7    | Day 7           |
+| D14   | Day 14          |
+
+There are **3 biological replicates per time point** (9 samples total). We want to find genes that change in expression over time, comparing D7 and D14 each back to the D0 baseline.
+
+---
+
+# Setup
+
+## Load libraries
+
+```{r libraries}
+# BiocManager::install("DESeq2", force = TRUE)  # run once if not installed
+library(DESeq2)     # core DGE analysis
+library(tidyverse)  # data wrangling & ggplot2
+library(pheatmap)   # heatmap plotting
+```
+
+> **Why these packages?**  
+> `DESeq2` is a Bioconductor package specifically designed for count-based RNA-seq data. It handles the statistical challenges of read counts (discrete values, overdispersion, varying library sizes) better than approaches designed for continuous data like microarrays.
+
+---
+
+# Read in Data
+
+```{r read-data}
+
+# Gene count matrix: rows = genes, columns = samples
+Gene_matrix <- read.table("Gene_matrix.txt", sep = "\t", header = TRUE)
+dim(Gene_matrix)
+# [1] 28524     9
+```
+
+The count matrix contains **28,524 genes** across **9 samples**. Each value represents the number of sequencing reads that mapped to that gene in that sample — a proxy for how much that gene is being expressed.
+
+```{r read-pheno}
+# Metadata / phenotype table: one row per sample
+pheno_data <- read.table("Metadata.txt", sep = "\t", header = TRUE) %>%
+  mutate(Day = factor(Day)) %>%              # treat Day as a categorical variable
+  column_to_rownames("Sample_ID") %>%
+  mutate(Sample_ID = rownames(.))
+
+dim(pheno_data)
+# [1] 9 3
+
+levels(pheno_data$Day)
+# [1] "D0"  "D14" "D7"
+```
+
+> **Why `factor(Day)`?**  
+> R needs to know that D0, D7, D14 are *groups*, not numbers. Making it a factor also lets DESeq2 automatically set the first alphabetical level (D0) as the reference for comparisons — which is exactly what we want.
+
+```{r check-order}
+# CRITICAL: sample order in metadata must match column order in count matrix
+all(rownames(pheno_data) == colnames(Gene_matrix))
+# [1] TRUE
+```
+
+> ⚠️ **This check is essential.** If the samples are mismatched, your results will be nonsense. Always verify before running DESeq2.
+
+---
+
+# DESeq2 Analysis
+
+## Build the DESeqDataSet object
+
+```{r build-dds}
+# DESeqDataSetFromMatrix needs an integer matrix + metadata + experimental design
+dds <- DESeqDataSetFromMatrix(Gene_matrix, pheno_data, design = ~ Day)
+```
+
+The `design = ~ Day` formula tells DESeq2 which variable to use when testing for differential expression. This is where you'd add batch effects or covariates if you had them (e.g., `~ Batch + Day`).
+
+## Filter low-count genes
+
+```{r filter-genes}
+# Keep genes with at least 10 counts in at least 3 samples (our smallest group size)
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds  <- dds[keep, ]
+
+dim(dds)
+# [1] 15922     9
+```
+
+We go from ~28,500 genes down to **~15,900** after filtering. Genes with very low counts across all samples:
+
+- Carry little statistical power (you can't reliably detect changes in a gene with 0–2 reads)
+- Increase the multiple-testing burden, raising your false-discovery rate
+- Are often noise (mapping artefacts, pseudogenes, etc.)
+
+## Run DESeq2
+
+```{r run-deseq2, cache=TRUE}
+dds <- DESeq(dds)
+```
+
+`DESeq()` does three things in one call:
+
+1. **Estimates size factors** — normalises for differences in sequencing depth between samples (similar in spirit to CPM normalisation, but more robust)
+2. **Estimates dispersion** — models gene-by-gene variability. RNA-seq counts are overdispersed (variance > mean), so DESeq2 fits a negative binomial model rather than a simpler Poisson model
+3. **Fits the GLM and tests** — for each gene, fits a generalised linear model and performs a Wald test for each contrast
+
+---
+
+# PCA Plot
+
+Principal Component Analysis (PCA) is a quality-control step we do *before* looking at individual gene results. It reduces the entire transcriptome to a 2D summary so we can check whether samples cluster as expected.
+
+## Variance-stabilising transformation (VST)
+
+```{r vst}
+# VST makes count data more suitable for PCA / clustering
+vsd <- vst(dds, blind = FALSE)
+```
+
+Raw counts are not suitable for PCA because highly expressed genes dominate simply by having larger absolute variance. The VST compresses the dynamic range so that all genes contribute more equally. `blind = FALSE` means it uses the experimental design when estimating dispersion — appropriate when you're not doing blind QC.
+
+## Create the PCA plot
+
+```{r pca-plot}
+pcaData   <- plotPCA(vsd, intgroup = "Day", returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+pcaPlot <- ggplot(pcaData, aes(x = PC1, y = PC2, color = Day)) +
+  geom_point(size = 3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed()
+
+pcaPlot
+
+ggsave("PCA_plot.pdf", pcaPlot, device = "pdf")
+```
+
+### How to interpret the PCA plot
+
+- **Each point is one sample.** Points close together have similar overall gene expression profiles.
+- **Good signs:** Replicates of the same time point cluster tightly together; different time points separate from each other. This confirms that Day is the dominant source of variation and that the experiment worked.
+- **Warning signs:** An outlier replicate sitting far from its group, or samples clustering by batch/run date rather than by Day — these would need investigation before trusting DGE results.
+- **Variance explained:** The axis labels tell you how much of the total transcriptome-wide variation each PC captures. A high PC1 % (e.g., >50%) with clear group separation is a reassuring sign.
+
+---
+
+# Differential Expression Results
+
+## Extract results for each contrast
+
+```{r results}
+# contrast = c("variable", "numerator", "denominator")
+# Positive fold change = higher in numerator (D7 or D14) relative to denominator (D0)
+res_D7_vs_D0  <- results(dds, contrast = c("Day", "D7",  "D0"))
+res_D14_vs_D0 <- results(dds, contrast = c("Day", "D14", "D0"))
+```
+
+Each results table contains, for every gene:
+
+| Column          | Meaning |
+|-----------------|---------|
+| `baseMean`      | Average normalised count across all samples |
+| `log2FoldChange`| log₂(numerator / denominator) — the effect size |
+| `lfcSE`         | Standard error of the log2FC estimate |
+| `stat`          | Wald test statistic |
+| `pvalue`        | Unadjusted p-value |
+| `padj`          | p-value adjusted for multiple testing (Benjamini-Hochberg FDR) |
+
+> **Always use `padj`, not `pvalue`.** We test ~16,000 genes simultaneously. By chance, ~5% (800 genes!) would appear significant at p < 0.05 even if nothing were truly changing. `padj` controls the false discovery rate (FDR) — a `padj` of 0.05 means we expect 5% of our "significant" hits to be false positives.
+
+```{r summaries}
+summary(res_D7_vs_D0)
+summary(res_D14_vs_D0)
+```
+
+---
+
+## MA Plots
+
+An MA plot visualises the relationship between expression level and fold change for all genes simultaneously.
+
+```{r ma-plots, fig.width=10}
+par(mfrow = c(1, 2))
+plotMA(res_D7_vs_D0,  main = "D7 vs D0",  ylim = c(-5, 5))
+plotMA(res_D14_vs_D0, main = "D14 vs D0", ylim = c(-5, 5))
+par(mfrow = c(1, 1))
+```
+
+### How to interpret MA plots
+
+- **X-axis (A):** Mean expression level — genes on the right are more highly expressed.
+- **Y-axis (M):** log₂ fold change — above 0 means upregulated, below 0 means downregulated.
+- **Blue/red points:** Statistically significant DEGs (padj < 0.1 by default).
+- **What to look for:** The cloud of grey points should be centered around M = 0 (most genes don't change). If the whole cloud is shifted up or down, there may be a normalisation issue. You'll notice that low-expression genes (left side) have more scatter — this is expected, since estimates are noisier with fewer counts. DESeq2's shrinkage estimator pulls extreme fold changes at low counts toward zero.
+
+---
+
+## Volcano Plots
+
+Volcano plots combine fold change and statistical significance in one view, making it easy to see the most biologically meaningful DEGs.
+
+```{r volcano-prep}
+# Helper function: convert DESeq2 results to a tidy data frame
+prep_volcano <- function(res, contrast_label) {
+  as.data.frame(res) %>%
+    rownames_to_column("gene") %>%
+    filter(!is.na(padj)) %>%      # remove genes excluded from testing
+    mutate(
+      contrast = contrast_label,
+      sig = case_when(
+        padj < 0.05 & log2FoldChange >  1 ~ "Up",
+        padj < 0.05 & log2FoldChange < -1 ~ "Down",
+        TRUE ~ "NS"   # Not Significant
+      )
+    )
+}
+
+volcano_data <- bind_rows(
+  prep_volcano(res_D7_vs_D0,  "D7 vs D0"),
+  prep_volcano(res_D14_vs_D0, "D14 vs D0")
+)
+```
+
+```{r volcano-plot}
+volcanoPlot <- ggplot(volcano_data, aes(x = log2FoldChange, y = -log10(padj), color = sig)) +
+  geom_point(alpha = 0.5, size = 1) +
+  scale_color_manual(values = c("Up" = "red", "Down" = "blue", "NS" = "grey70")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  facet_wrap(~ contrast) +
+  labs(
+    x     = "log2 Fold Change",
+    y     = "-log10 adjusted p-value",
+    color = "Direction"
+  ) +
+  theme_bw()
+
+volcanoPlot
+
+ggsave("Volcano_plot.pdf", volcanoPlot, device = "pdf")
+```
+
+### How to interpret volcano plots
+
+- **X-axis:** Effect size. Right = upregulated in the later time point vs D0; left = downregulated.
+- **Y-axis:** Statistical confidence. Higher up = more significant (more negative log of padj).
+- **Dashed lines:** Our significance thresholds. The vertical lines mark |log2FC| = 1 (i.e., a 2-fold change); the horizontal line marks padj = 0.05.
+- **Coloured points (upper corners):** These are our "hits" — genes that are both statistically significant AND biologically meaningful in magnitude. A gene can be statistically significant but have a tiny fold change (meaningful only with enormous sample sizes), or have a large fold change but high variability (not significant). The top corners capture both.
+- **Comparing panels:** More dots in the upper corners for D14 vs D0 than D7 vs D0 suggests the transcriptome changes accumulate over time — a common finding in time-course experiments.
+
+---
+
+## Heatmap
+
+The heatmap lets us visualise the expression pattern of the top DEGs across all samples at once, and see whether genes cluster into coherent groups (e.g., early-response genes vs late-response genes).
+
+```{r heatmap-prep}
+# Pool both contrasts, sort by padj, take the top 50 unique genes
+top_genes <- bind_rows(
+  as.data.frame(res_D7_vs_D0)  %>% rownames_to_column("gene"),
+  as.data.frame(res_D14_vs_D0) %>% rownames_to_column("gene")
+) %>%
+  filter(!is.na(padj)) %>%
+  arrange(padj) %>%
+  distinct(gene, .keep_all = TRUE) %>%   # keep each gene only once
+  slice_head(n = 50) %>%
+  pull(gene)
+
+# Extract VST-normalised counts for those genes
+mat        <- assay(vsd)[top_genes, ]
+
+# Z-score each row (gene) so colours reflect relative change, not absolute expression
+mat_scaled <- t(scale(t(mat)))
+
+# Column annotations
+annotation_col <- data.frame(Day = pheno_data$Day)
+rownames(annotation_col) <- rownames(pheno_data)
+```
+
+```{r heatmap, fig.height=9}
+pheatmap(
+  mat_scaled,
+  annotation_col = annotation_col,
+  cluster_rows   = TRUE,
+  cluster_cols   = TRUE,
+  show_rownames  = TRUE,
+  show_colnames  = TRUE,
+  fontsize_row   = 7,
+  main           = "Top 50 DEGs (scaled VST counts)"
+)
+```
+
+### How to interpret the heatmap
+
+- **Colour:** Each cell's colour reflects the **z-score** of that gene in that sample. Blue = below the gene's mean expression; red = above the gene's mean. We z-score so that all genes are on the same scale regardless of their absolute expression level.
+- **Row clustering (genes):** Genes with similar expression patterns across samples are grouped together by hierarchical clustering. Look for distinct blocks — e.g., a cluster that goes red at D14 but stays blue at D0 and D7 represents late-induced genes.
+- **Column clustering (samples):** Samples with similar overall expression profiles cluster together. Ideally, replicates of the same Day group next to each other, confirming biological reproducibility.
+- **Why pool contrasts for top genes?** Taking the 50 lowest padj genes from either comparison gives a more complete picture of the biology than looking at one contrast alone — you'll catch genes that are most changed early (D7) or late (D14).
+
+---
+
+# Summary
+
+Here is a brief recap of the full workflow:
+
+```
+Raw count matrix
+      │
+      ▼
+DESeqDataSetFromMatrix()   ← attach metadata & design
+      │
+      ▼
+Filter low-count genes     ← remove noise, reduce multiple testing
+      │
+      ▼
+DESeq()                    ← normalise → estimate dispersion → fit GLM → test
+      │
+      ├──── vst() → PCA          (QC: do samples separate as expected?)
+      │
+      ├──── results() → MA plot  (global view of effect size vs expression)
+      │
+      ├──── results() → Volcano  (which genes are significant AND large change?)
+      │
+      └──── results() → Heatmap  (patterns across top DEGs and all samples)
+```
+
+### Key thresholds used in this analysis
+
+| Threshold               | Value  | Rationale |
+|-------------------------|--------|-----------|
+| Minimum counts filter   | ≥ 10 counts in ≥ 3 samples | Remove unreliably low-count genes |
+| Adjusted p-value cutoff | < 0.05 | 5% FDR |
+| Fold-change cutoff      | \|log2FC\| > 1 | At least a 2-fold change |
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

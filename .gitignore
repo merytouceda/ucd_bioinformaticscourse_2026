@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Directories to ignore
+/data
+/scripts/day4/STAR
+/scripts/day4/Reference_Genome

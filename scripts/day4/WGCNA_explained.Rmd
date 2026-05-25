@@ -1,0 +1,501 @@
+---
+title: "Co-expression Network Analysis with WGCNA"
+subtitle: "A guided walkthrough for Veterinary Bioinformatics"
+author: "RNA-seq Course — Day 2"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+```
+
+---
+
+# Background: What is a co-expression network?
+
+After running DESeq2, we know **which genes** change significantly between time points. But that analysis treats every gene independently. A co-expression network asks a different question:
+
+> **Which genes tend to go up and down together across samples — and what does that tell us about shared biology?**
+
+Genes that are consistently co-expressed are likely regulated by the same transcription factors, involved in the same pathways, or functionally related. By grouping them into **modules**, we can summarise thousands of genes into a handful of patterns and ask which patterns associate with our experimental conditions (D0, D7, D14).
+
+WGCNA (**W**eighted **G**ene **C**o-expression **N**etwork **A**nalysis) is the standard R package for this. The key word is *weighted* — rather than a binary "connected / not connected" decision, every pair of genes gets a continuous connection strength between 0 and 1.
+
+---
+
+# Setup and data preparation
+
+```{r libraries}
+library(DESeq2)
+library(ggplot2)
+library(WGCNA)
+library(dplyr)
+library(tibble)
+library(tidyr)
+
+allowWGCNAThreads()  # enable multi-threading for speed
+```
+## Load and prep the data
+```{r load-data}
+setwd("~/Documents/GitHub/ucd_bioinformaticscourse_2026/scripts/day2/DESeq2/")
+
+Gene_matrix <- read.table("Gene_matrix.txt", sep="\t", header=TRUE)
+pheno_data  <- read.table("Metadata.txt",    sep="\t", header=TRUE) %>%
+  mutate(Day = factor(Day)) %>%
+  column_to_rownames("Sample_ID") %>%
+  mutate(Sample_ID = rownames(.))
+```
+
+
+## Prep data and run DESeq2
+```{r deseq2}
+# ==============================
+# Prep data for DESeq2
+# DESeqDataSetFromMatrix requires a plain matrix, so convert
+dds <- DESeqDataSetFromMatrix(Gene_matrix, pheno_data, design = ~ Day)
+
+# Filter genes
+# Keep genes that have at least 10 counts across the smallest group size
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep,]
+
+dim(dds)
+#[1] 15922     9
+
+# Run DESeq2
+dds <- DESeq(dds)
+```
+
+## Why do we use VST-normalised data, not raw counts?
+
+WGCNA works by computing **Pearson correlations** between gene expression profiles. Raw counts are not appropriate here for two reasons:
+
+1. **Heteroscedasticity** — in RNA-seq, highly expressed genes naturally show much larger absolute count differences between samples than lowly expressed genes, even if their *relative* variation is the same. Pearson correlation is distorted by this.
+2. **Skewed distributions** — raw counts are right-skewed integers; correlation assumes approximately continuous, roughly symmetric data.
+
+The **Variance-Stabilizing Transformation (VST)** from DESeq2 corrects for both. It compresses the dynamic range so that variance is roughly constant across the expression range, making correlations between genes meaningful and comparable regardless of their expression level.
+
+```{r vst}
+# Run VST normalization
+vsd <- vst(dds, blind=FALSE)
+
+# WGCNA expects samples as ROWS, genes as COLUMNS (opposite of DESeq2)
+datExpr <- t(assay(vsd))
+dim(datExpr)  # should be 9 samples x ~15922 genes
+```
+
+## Quality control: `goodSamplesGenes()`
+
+```{r qc}
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+
+if (!gsg$allOK) {
+  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
+  message("Removed ", sum(!gsg$goodGenes), " genes and ",
+          sum(!gsg$goodSamples), " samples after QC")
+}
+```
+
+This function flags genes or samples with excessive missing values or zero variance. With count data filtered by DESeq2 this rarely removes anything, but it is good practice and shows students that WGCNA has its own layer of quality checking.
+
+---
+
+# The soft-thresholding power β
+
+This is the most conceptually important step in WGCNA. Take your time here.
+
+## From raw correlations to connection weights
+
+For every pair of genes, WGCNA computes the Pearson correlation of their expression across all samples. This gives a number between −1 and +1 for each of the ~127 million gene pairs.
+
+The question is: how do we turn a correlation into a meaningful **connection weight**?
+
+The naive approach — a **hard threshold** — would say "connected if |r| > 0.8, disconnected otherwise." The problem is that this is binary and arbitrary: a correlation of 0.79 is treated identically to 0.0, while 0.81 is treated identically to 1.0. We lose a lot of information.
+
+WGCNA instead uses a **soft threshold**: raise the absolute correlation to a power β:
+
+$$w_{ij} = |r_{ij}|^\beta$$
+
+This keeps all pairs connected, but with weights that reflect their true similarity. The power β controls how aggressively weak correlations are downweighted.
+
+## What does β actually do?
+
+The table below illustrates the effect of different powers on the same set of correlations:
+
+| Correlation | β = 1 | β = 4 | β = 8 | β = 12 |
+|:-----------:|:-----:|:-----:|:-----:|:------:|
+| 1.00        | 1.000 | 1.000 | 1.000 | 1.000  |
+| 0.90        | 0.900 | 0.656 | 0.430 | 0.282  |
+| 0.70        | 0.700 | 0.240 | 0.058 | 0.014  |
+| 0.50        | 0.500 | 0.063 | 0.004 | ~0.000 |
+| 0.30        | 0.300 | 0.008 | ~0.000| ~0.000 |
+
+At **β = 1** you are using raw correlations — everything stays connected and the network has no structure.  
+At **β = 12** only very strongly correlated genes retain meaningful connection weights — the network becomes sparse and biologically interpretable.
+
+> **Intuition:** The power is like a contrast dial on a photograph. Turn it up and you see clear structure; the bright spots get brighter and the dim spots fade to black. Turn it too high and you lose real detail.
+
+## Why not just pick any power?
+
+Because the right β depends on the correlation structure of *your specific data*. You need a β that is high enough to impose structure, but not so high that you destroy real biological signal.
+
+## The scale-free topology criterion
+
+The criterion WGCNA uses is **scale-free topology**. In a scale-free network, the distribution of node connectivities (how many connections each node has) follows a power law — a few hub nodes are very highly connected, and most nodes have only a few connections.
+
+This is not arbitrary: real biological networks — protein–protein interaction networks, metabolic networks, gene regulatory networks — are consistently observed to be approximately scale-free. So the reasoning is:
+
+> If our co-expression network is capturing real biology, it should also look approximately scale-free.
+
+`pickSoftThreshold()` tests each candidate power (1–20) and measures how well the resulting network fits a scale-free distribution, reporting this as R².
+
+```{r pick-power}
+powers <- 1:20
+sft    <- pickSoftThreshold(datExpr, powerVector = powers, verbose = 5)
+```
+
+---
+
+# Plot 1: Scale-free topology fit
+
+## How to read this plot
+
+```{r sft-plot}
+sft_plot <- ggplot(
+  data.frame(
+    Power  = sft$fitIndices[, 1],
+    SFT.R2 = -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2]
+  ),
+  aes(x = Power, y = SFT.R2, label = Power)
+) +
+  geom_point(color = "steelblue") +
+  geom_text(vjust = -0.5, size = 3) +
+  geom_hline(yintercept = 0.80, linetype = "dashed", color = "red") +
+  xlab("Soft Threshold (power β)") +
+  ylab("Scale-Free Topology R²") +
+  ggtitle("Scale-free topology fit — choose power above the red line") +
+  theme_bw()
+
+sft_plot
+ggsave("WGCNA_soft_threshold.pdf", sft_plot, device = "pdf")
+```
+
+**X-axis:** The candidate power values (1 through 20).
+
+**Y-axis:** R² from fitting the connectivity distribution to a power law. Values closer to 1 mean the network looks more scale-free.
+
+**What to look for:** The *lowest* power at which R² first crosses **0.80** (the red dashed line). This is the "elbow" — going higher than this adds little improvement in fit but increasingly collapses the network.
+
+**Common patterns:**
+
+- R² climbs steeply then plateaus → pick the first power at or above 0.80
+- R² never reaches 0.80 → your data may have too few samples (likely with n = 9), or very weak co-expression structure; try the highest power before R² starts to decline, and note the limitation
+- R² jumps past 0.80 immediately at low power → check your data; it may already be very structured or you may have a batch effect driving everything
+
+> ⚠️ **A note on sample size:** WGCNA was designed for datasets with at least 15 samples. With 9 samples, the correlation estimates are noisy and `pickSoftThreshold()` may return `NA` for its automated suggestion. This is a valuable teaching point — more samples produce more reliable networks. The network we build here is illustrative, not definitive.
+
+---
+
+# Plot 2: Mean connectivity
+
+## How to read this plot
+
+```{r conn-plot}
+conn_plot <- ggplot(
+  data.frame(
+    Power = sft$fitIndices[, 1],
+    MeanK = sft$fitIndices[, 5]
+  ),
+  aes(x = Power, y = MeanK, label = Power)
+) +
+  geom_point(color = "darkorange") +
+  geom_text(vjust = -0.5, size = 3) +
+  xlab("Soft Threshold (power β)") +
+  ylab("Mean Connectivity (k)") +
+  ggtitle("Mean connectivity vs power") +
+  theme_bw()
+
+conn_plot
+ggsave("WGCNA_mean_connectivity.pdf", conn_plot, device = "pdf")
+```
+
+**X-axis:** The candidate power values.
+
+**Y-axis:** The average number of connections per gene (weighted sum of connection weights), given that power.
+
+**What to look for:** This plot is a sanity check used *alongside* the scale-free plot, not instead of it. As power increases, mean connectivity always decreases. The concern is whether it drops too low — a mean connectivity of less than ~100 suggests the network is becoming very sparse, which can make module detection unreliable.
+
+**How to use both plots together:** Pick the power from the scale-free plot, then check that the corresponding mean connectivity is not unreasonably low. If the scale-free R² doesn't reach 0.80 until power = 18 but mean connectivity is essentially 0 by then, you have a problem and should discuss whether the data is suitable for WGCNA.
+
+---
+
+# Building the network
+
+```{r build-network}
+soft_power <- 7   # set manually
+
+net <- blockwiseModules(
+  datExpr,
+  power             = soft_power,
+  TOMType           = "unsigned",
+  minModuleSize     = 5,          # minimum genes per module; 30 is typical in real studies
+  mergeCutHeight    = 0.25,
+  numericLabels     = FALSE,      # use color names rather than numbers
+  pamRespectsDendro = FALSE,
+  saveTOMs          = FALSE,
+  verbose           = 3
+)
+```
+
+## What is `blockwiseModules()` doing internally?
+
+There are five steps happening inside this single function call:
+
+**Step 1 — Adjacency matrix.** For every pair of genes, compute |correlation|^β. This creates a symmetric matrix of connection weights between 0 and 1.
+
+**Step 2 — Topological Overlap Matrix (TOM).** Rather than clustering on raw adjacency, WGCNA first computes the TOM. Two genes get a high TOM value not only if *they* are strongly correlated, but also if they *share many of the same neighbors*. This makes clusters much more robust to noise — a gene that is co-expressed with 50 others in a tight group is confidently placed even if some individual pairwise correlations are slightly noisy.
+
+**Step 3 — Hierarchical clustering.** Genes are clustered using (1 − TOM) as a distance measure. This produces a dendrogram.
+
+**Step 4 — Dynamic tree cut.** Modules are cut from the dendrogram adaptively, respecting the tree shape and subject to `minModuleSize`. This is more flexible than a fixed height cut.
+
+**Step 5 — Module merging.** Modules whose eigengenes are highly correlated (above 1 − `mergeCutHeight` = 0.75) get merged, since they likely represent the same biological process split by noise.
+
+```{r module-summary}
+# How many genes per module?
+table(net$colors)
+```
+
+> The **gray module** is special — it contains genes that did not fit into any module. It is not a real co-expression module and should be ignored in downstream analyses.
+
+---
+
+# Plot 3: Gene dendrogram with module colors
+
+## How to read this plot
+
+```{r dendrogram}
+pdf("WGCNA_dendrogram.pdf", width = 10, height = 5)
+plotDendroAndColors(
+  net$dendrograms[[1]],
+  net$colors[net$blockGenes[[1]]],
+  "Module colors",
+  dendroLabels  = FALSE,
+  hang          = 0.03,
+  addGuide      = TRUE,
+  guideHang     = 0.05,
+  main          = "Gene dendrogram and module assignment"
+)
+dev.off()
+```
+
+**The dendrogram (top panel):** Each leaf is one gene. The height at which two branches merge reflects their TOM-dissimilarity — branches that merge low on the tree are strongly co-expressed; branches that merge near the top are weakly related.
+
+**The color bar (bottom panel):** Each gene's module assignment. Genes of the same color are in the same module. The color bar should look like solid blocks of color aligning with the branches of the dendrogram — this is evidence that the modules are capturing real clusters in the data.
+
+**What to look for:**
+
+- Clear, wide blocks of color → well-defined modules, good signal
+- Many narrow slivers of color → many small modules, potentially noisy data or power that is too low
+- Everything one color (plus gray) → modules are being merged too aggressively; try lowering `mergeCutHeight`
+- Very large gray region → many genes unassigned; try lowering `minModuleSize`
+
+---
+
+# Module eigengenes: the summary of each module
+
+## What is an eigengene?
+
+For each module, WGCNA runs PCA on the expression matrix of all member genes and takes the **first principal component**. This is the eigengene — a single expression profile that represents the overall behavior of all genes in that module across your samples.
+
+Think of it as the "average expression pattern" of the module, but computed in a way that captures the dominant axis of variation rather than just the mean.
+
+## Plot 4: Eigengene expression across time points
+
+```{r eigengenes}
+MEs <- net$MEs
+
+MEs_plot <- MEs %>%
+  rownames_to_column("Sample_ID") %>%
+  left_join(pheno_data, by = "Sample_ID") %>%
+  pivot_longer(cols = starts_with("ME"), names_to = "Module", values_to = "Eigengene") %>%
+  mutate(Module = sub("^ME", "", Module))
+
+eigengene_plot <- ggplot(MEs_plot, aes(x = Day, y = Eigengene, color = Day, group = Day)) +
+  geom_jitter(width = 0.1, size = 2) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.4, color = "black") +
+  facet_wrap(~Module, scales = "free_y") +
+  xlab("Day") +
+  ylab("Module eigengene") +
+  ggtitle("Module eigengene expression by time point") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+eigengene_plot
+ggsave("WGCNA_eigengenes.pdf", eigengene_plot, width = 20, height = 15, device = "pdf")
+```
+
+**Each panel** is one module (named by color). The points are individual samples; the black bar is the mean.
+
+**What to look for:**
+
+- **A module with high eigengene at D0 and low at D7/D14** → contains genes that are downregulated over the infection time course
+- **A module that rises from D0 to D14** → genes progressively upregulated — possibly an immune response ramping up
+- **A module with no clear trend across days** → may relate to biological variation not captured by time point (individual animal effects, etc.)
+- **Tight clustering within each day** → consistent signal; samples within the same time point behave similarly, which is reassuring
+- **One sample wildly different from its group** → a potential outlier worth investigating
+
+> Note: the y-axis scale differs between modules (`scales = "free_y"`). The absolute values are not comparable between modules — only the *pattern across days* within each panel matters.
+
+---
+
+# Plot 5: Module–trait correlation heatmap
+
+## How to read this plot
+
+```{r trait-heatmap}
+trait_matrix <- data.frame(
+  D0  = as.integer(pheno_data$Day == "D0"),
+  D7  = as.integer(pheno_data$Day == "D7"),
+  D14 = as.integer(pheno_data$Day == "D14")
+)
+rownames(trait_matrix) <- rownames(pheno_data)
+
+module_trait_cor  <- cor(MEs, trait_matrix, use = "pairwise.complete.obs")
+module_trait_pval <- corPvalueStudent(module_trait_cor, nSamples = nrow(datExpr))
+
+text_matrix <- paste0(
+  round(module_trait_cor, 2), "\n(",
+  signif(module_trait_pval, 1), ")"
+)
+dim(text_matrix) <- dim(module_trait_cor)
+
+pdf("WGCNA_module_trait_heatmap.pdf", width = 20, height = 15)
+labeledHeatmap(
+  Matrix        = module_trait_cor,
+  xLabels       = colnames(module_trait_cor),
+  yLabels       = rownames(module_trait_cor),
+  ySymbols      = rownames(module_trait_cor),
+  colorLabels   = FALSE,
+  colors        = blueWhiteRed(50),
+  textMatrix    = text_matrix,
+  setStdMargins = FALSE,
+  cex.text      = 0.7,
+  zlim          = c(-1, 1),
+  main          = "Module–trait correlations\n(r, p-value)"
+)
+dev.off()
+```
+
+**Rows:** Modules (named by color). Remember to ignore MEgray.  
+**Columns:** Traits — here the three time points encoded as binary (1 = this sample is from this day, 0 = it is not).  
+**Cell color:** The Pearson correlation between the module eigengene and the trait. Red = positive correlation; blue = negative correlation; white = no correlation.  
+**Cell text:** The correlation coefficient r and its p-value in parentheses.
+
+**How to interpret the cells:**
+
+| Cell value | Meaning |
+|:-----------|:--------|
+| r = 0.95, p = 0.001 (D7 column) | This module's genes are highly expressed specifically at D7 |
+| r = −0.85, p = 0.01 (D0 column) | This module's genes are *lowly* expressed at D0 — i.e., they are activated after infection |
+| r = 0.10, p = 0.80 | No meaningful association with this time point |
+
+> ⚠️ **P-value warning:** With only 9 samples, the statistical power is very low. Do not over-interpret p-values. A correlation of r = 0.70 may not reach p < 0.05 with n = 9. Focus on the *magnitude and direction* of the correlations rather than strict significance thresholds.
+
+**What to look for overall:**
+
+- Modules with strong positive correlation for one time point and strong negative for another are the most interesting — they show a clear, specific expression pattern
+- A module positively correlated with D14 and negatively with D0 is upregulated over the course of infection — prime candidates for immune response or tissue remodeling pathways
+- If a module is positively correlated with *all* time points equally, it is likely driven by constitutively expressed housekeeping genes
+
+---
+
+# Hub genes: finding the key players in a module
+
+```{r hub-genes}
+module_of_interest <- "turquoise"  # change to whichever module interests you
+
+# Module membership (kME): correlation of each gene's expression with its module eigengene
+# A high kME means the gene tracks very closely with the module's overall pattern
+kME <- signedKME(datExpr, MEs)
+
+hub_genes <- kME %>%
+  rownames_to_column("Gene") %>%
+  select(Gene, kME = paste0("kME", module_of_interest)) %>%
+  filter(Gene %in% names(net$colors)[net$colors == module_of_interest]) %>%
+  arrange(desc(kME)) %>%
+  head(20)
+
+hub_genes
+write.csv(hub_genes, paste0("WGCNA_hub_genes_", module_of_interest, ".csv"), row.names = FALSE)
+```
+
+**Module membership (kME)** is the correlation between a gene's expression and its module's eigengene. A gene with kME = 0.98 tracks the module almost perfectly — it is a **hub gene**, likely a regulator or key player. A gene with kME = 0.55 is on the periphery of the module.
+
+Hub genes from modules that correlate strongly with a trait of interest are the best candidates for:
+
+- Functional enrichment analysis (which pathways are enriched among hub genes?)
+- Validation experiments (are these known immune genes? Novel candidates?)
+- Integration with DESeq2 results (are these genes also differentially expressed?)
+
+---
+
+# Connecting WGCNA back to DESeq2
+
+A powerful exercise is to ask: do the genes DESeq2 identified as differentially expressed tend to fall in specific WGCNA modules?
+
+```{r integration}
+# Get DESeq2 results for D7 vs D0
+res_D7 <- results(dds, contrast = c("Day", "D7", "D0"))
+
+# Get significantly DE genes
+sig_genes <- rownames(res_D7)[which(res_D7$padj < 0.05 & abs(res_D7$log2FoldChange) > 1)]
+
+# Which modules do they fall in?
+module_assignments <- data.frame(
+  Gene   = names(net$colors),
+  Module = net$colors
+)
+
+sig_in_modules <- module_assignments %>%
+  filter(Gene %in% sig_genes) %>%
+  count(Module, sort = TRUE)
+
+sig_in_modules
+```
+
+If most DE genes fall in 1–2 WGCNA modules, those modules are likely capturing the core biology of the response. This is a satisfying convergence of two independent analytical approaches.
+
+---
+
+# Summary
+
+| Step | What we did | Why |
+|:-----|:-----------|:----|
+| VST normalization | Stabilize variance across genes | Raw counts distort Pearson correlations |
+| `goodSamplesGenes()` | Flag problematic genes/samples | QC before building network |
+| `pickSoftThreshold()` | Choose power β | Controls how aggressively weak correlations are downweighted |
+| Scale-free plot | Find elbow above R² = 0.80 | Ensures network approximates real biological network structure |
+| Mean connectivity plot | Sanity check that network is not too sparse | High powers can collapse the network |
+| `blockwiseModules()` | Build adjacency → TOM → cluster → cut → merge | Full network construction pipeline |
+| Dendrogram + color bar | Visualize module assignments | Confirms modules align with dendrogram structure |
+| Eigengene plots | Summarize each module's expression pattern across samples | Identify which modules respond to the time course |
+| Module–trait heatmap | Correlate eigengenes with experimental conditions | Find modules most associated with infection |
+| Hub genes (kME) | Rank genes within a module by connectivity | Prioritize candidates for follow-up |
+
+> **Final note on sample size:** Everything we built here with 9 samples is a valid teaching example, but interpret results with appropriate caution. WGCNA reaches its full power with 15–20+ samples. If this were a real study, you would want to validate key modules in an independent cohort or with an orthogonal method.
+
