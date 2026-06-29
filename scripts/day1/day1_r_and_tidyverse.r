@@ -1,3 +1,7 @@
+# Day 1. Learning R and tidyverse
+# Author: Mery Touceda-Suarez
+# Date: June 2026
+
 
 # installing and loading packages
 install.packages("tidyverse") #you only have to do this once
