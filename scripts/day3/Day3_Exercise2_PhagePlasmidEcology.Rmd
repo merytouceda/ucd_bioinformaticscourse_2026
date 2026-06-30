@@ -1,0 +1,276 @@
+---
+title: "Phage and Plasmid Ecology Analyses (DWW)"
+subtitle: "Day 3, Exercise 2 — UCD Bioinformatics Course"
+author: "Mery Touceda-Suarez"
+date: "June 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Overview and Steps Guide
+
+In this exercise you will explore the ecology of phages (viruses) and plasmids recovered from wastewater metagenomes. You will work through the same workflow for both groups: prepare the data, calculate alpha diversity, and then examine community composition (beta diversity).
+
+Use the list below as your roadmap. Each step corresponds to a section further down in this document.
+
+1. **Load libraries** — load `tidyverse` and `vegan`, the two packages we'll use throughout.
+2. **Load and prepare the data** — read in the metadata, vOTU (viral) count table, and pOTU (plasmid) count table; reshape and align them so every table has samples in the same order.
+3. **Sanity-check sample order** — confirm metadata and count tables match before doing any analysis.
+4. **Alpha diversity** — rarefy the count tables and calculate richness and Shannon diversity for both phages and plasmids; visualize differences across sites.
+5. **Normalize abundances** — calculate RPKM (for viral/plasmid load) and TPM (for composition comparisons) using contig/sequence length and sequencing depth.
+6. **Community composition (beta diversity)** — compute Bray-Curtis dissimilarities, run NMDS ordinations, test for effects of site and collection date with PERMANOVA (`adonis2`), and plot ordinations for both phages and plasmids.
+7. **Discuss the open questions** — at the end of the script, use what you've learned to think through the follow-up questions about diversity, composition, and length/abundance relationships.
+
+Work through each code chunk in order, and don't forget to update the file paths to match your own project directory before running.
+
+---
+
+# 1. Load Libraries
+
+```{r libraries}
+library(tidyverse)
+library(vegan)
+```
+
+# 2. Load and Prepare Data
+
+## 2.1 Metadata
+
+```{r load-metadata}
+md <- read.csv("~/Documents/GitHub/ucd_bioinformaticscourse_2026/data/metadata_day3.csv")
+
+md <- md %>%
+  arrange(desc(sample)) %>%
+  # make site variable
+  mutate(site = paste(country, city, plant)) %>%
+  # make date character into date class
+  mutate(collection_date_n = as.Date(collection_date))
+```
+
+## 2.2 Phages (vOTUs)
+
+```{r load-votus}
+votus_count <- read.table("~/Documents/GitHub/ucd_bioinformaticscourse_2026/data/votus_count_table.txt", 
+                           sep = "\t", header = TRUE)
+
+# prepare data
+votus_clean <- votus_count %>%
+  pivot_longer(!Contig, names_to = "sample", values_to = "counts") %>%
+  mutate(sample = str_remove(sample, ".Read.Count")) %>%
+  filter(sample %in% md$sample) %>%
+  pivot_wider(names_from = "Contig", values_from = "counts") %>%
+  arrange(desc(sample))
+```
+
+## 2.3 Plasmids (pOTUs)
+
+```{r load-potus}
+potus_count <- read.table("~/Documents/GitHub/ucd_bioinformaticscourse_2026/data/potus_count_table.txt", 
+                           sep = "\t", header = TRUE)
+
+# prepare data
+potus_clean <- potus_count %>%
+  pivot_longer(!Contig, names_to = "sample", values_to = "counts") %>%
+  mutate(sample = str_remove(sample, ".Read.Count")) %>%
+  filter(sample %in% md$sample) %>%
+  pivot_wider(names_from = "Contig", values_from = "counts") %>%
+  arrange(desc(sample))
+```
+
+# 3. Sanity Check: Sample Order
+
+Before doing any analysis, always confirm that your metadata and count tables are aligned in the same sample order.
+
+```{r check-order}
+md$sample == votus_clean$sample
+md$sample == potus_clean$sample
+```
+
+# 4. Alpha Diversity
+
+## 4.1 Prepare Count Tables
+
+```{r prep-rich}
+votus_for_rich <- votus_clean %>%
+  column_to_rownames(var = "sample") %>%
+  mutate(across(where(is.character), as.numeric))
+
+potus_for_rich <- potus_clean %>%
+  column_to_rownames(var = "sample") %>%
+  mutate(across(where(is.character), as.numeric))
+```
+
+## 4.2 Check Counts Distribution
+
+```{r check-distribution}
+summary(rowSums(votus_for_rich))
+hist(rowSums(votus_for_rich))
+
+summary(rowSums(potus_for_rich))
+hist(rowSums(potus_for_rich))
+```
+
+## 4.3 Calculate Diversity Measures
+
+```{r diversity-measures}
+md$viral_rich <- specnumber(rrarefy(votus_for_rich, sample = 71456))
+md$viral_shannon <- diversity(rrarefy(votus_for_rich, sample = 71456), index = "shannon")
+md$plasmid_rich <- specnumber(rrarefy(potus_for_rich, sample = 63508))
+md$plasmid_shannon <- diversity(rrarefy(potus_for_rich, sample = 63508), index = "shannon")
+```
+
+## 4.4 Differences per Site — Phages
+
+```{r viral-shannon-plot}
+ggplot(md, aes(x = site, y = viral_shannon)) +
+  geom_boxplot(aes(color = site)) +
+  xlab("") +
+  ylab("Number of vOTUs") +
+  theme_classic() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+# ggsave("CHANGE THIS PATH! /figures/viral_shannon_site.pdf", width = 5, height = 7, units = "in")
+```
+
+## 4.5 Differences per Site — Plasmids
+
+```{r plasmid-shannon-plot}
+ggplot(md, aes(x = site, y = plasmid_shannon)) +
+  geom_boxplot(aes(color = site)) +
+  xlab("") +
+  ylab("Number of pOTUs") +
+  theme_classic() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# 5. Community Composition
+
+## 5.1 RPKM/TPM Abundance Normalization — Phages
+
+```{r normalize-phages}
+total_reads <- md %>%
+  select(sample, total_reads)
+
+# load votus length
+votus_length <- read_csv("~/Documents/GitHub/ucd_bioinformaticscourse_2026/data/phages_summary.csv") %>%
+  select(c("votu", "contig_length"))
+
+# convert count table to long format
+votus_count_long <- votus_clean %>%
+  pivot_longer(cols = -c("sample"), values_to = "count", names_to = "votu")
+
+votus_count_long_plusreads <- left_join(votus_count_long, total_reads, by = "sample")
+votus_count_long_plusreads_pluslength <- left_join(votus_count_long_plusreads, votus_length, by = "votu")
+
+# RPKM (for viral load)
+rpkm_votu_count <- votus_count_long_plusreads_pluslength %>%
+  mutate(RPKM = (count * 1e6) / (contig_length * total_reads)) %>%
+  dplyr::select(-c("count", "total_reads", "contig_length")) %>%
+  pivot_wider(names_from = "sample", values_from = "RPKM") %>%
+  column_to_rownames(var = "votu") %>%
+  drop_na()
+
+# TPM (for composition comparisons, beta)
+tpm_votu_count <- votus_count_long_plusreads_pluslength %>%
+  mutate(RPK = (count * 1e6) / contig_length) %>%
+  group_by(sample) %>%
+  mutate(TPM = RPK / sum(RPK, na.rm = TRUE) * 1e6) %>%
+  ungroup() %>%
+  dplyr::select(-c("count", "total_reads", "contig_length", "RPK")) %>%
+  pivot_wider(names_from = "sample", values_from = "TPM") %>%
+  column_to_rownames(var = "votu") %>%
+  drop_na()
+```
+
+## 5.2 RPKM Abundance Normalization — Plasmids
+
+```{r normalize-plasmids}
+potus_length <- read_csv("~/Documents/GitHub/ucd_bioinformaticscourse_2026/data/plasmids_summary.csv") %>%   # change for your selection
+  select(c("seq_name", "length")) %>%
+  rename(potu = seq_name)
+
+potus_count_long <- potus_clean %>%
+  pivot_longer(cols = -c("sample"), values_to = "count", names_to = "potu")
+
+potus_count_long_plusreads <- left_join(potus_count_long, total_reads, by = "sample")
+potus_count_long_plusreads_pluslength <- left_join(potus_count_long_plusreads, potus_length, by = "potu")
+
+rpkm_potu_count <- potus_count_long_plusreads_pluslength %>%
+  mutate(RPKM = (count * 1e9) / (length * total_reads)) %>%
+  dplyr::select(-c("count", "total_reads", "length")) %>%
+  pivot_wider(names_from = "sample", values_from = "RPKM") %>%
+  column_to_rownames(var = "potu") %>%
+  drop_na()
+```
+
+## 5.3 Community Composition — Phages
+
+```{r phage-composition}
+viral.bray <- vegdist(t(rpkm_votu_count), method = "bray")
+
+# ordination (non-metric multidimensional scaling)
+viral.nmds <- metaMDS(viral.bray)
+md$bracken.Axis01 <- viral.nmds$points[, 1]
+md$bracken.Axis02 <- viral.nmds$points[, 2]
+viral.nmds$stress # 0.1588582
+
+# stats
+adonis2(viral.bray ~ site, data = md, permutations = 999, method = "bray")
+```
+
+### Ordination Plot — Phages
+
+```{r phage-ordination-plot}
+ggplot(md, aes(bracken.Axis01, bracken.Axis02)) +
+  geom_point(aes(alpha = collection_date_n, color = site), size = 3.5) +
+  stat_ellipse(aes(color = site)) +
+  theme_classic() +
+  theme(legend.position = "right", text = element_text(size = 12))
+
+# ggsave("CHANGE THIS PATH! /viral_composition_bydate.pdf", device = "pdf", width = 9, height = 5, units = "in")
+```
+
+## 5.4 Community Composition — Plasmids
+
+```{r plasmid-composition}
+plasmid.bray <- vegdist(t(rpkm_potu_count), method = "bray")
+
+# ordination (non-metric multidimensional scaling)
+plasmid.nmds <- metaMDS(plasmid.bray)
+md$bracken.Axis01 <- plasmid.nmds$points[, 1]
+md$bracken.Axis02 <- plasmid.nmds$points[, 2]
+plasmid.nmds$stress # 0.1588582
+
+# stats
+adonis2(plasmid.bray ~ site, data = md, permutations = 999, method = "bray")
+```
+
+### Ordination Plot — Plasmids
+
+```{r plasmid-ordination-plot}
+ggplot(md, aes(bracken.Axis01, bracken.Axis02)) +
+  geom_point(aes(alpha = collection_date_n, color = site), size = 3.5) +
+  stat_ellipse(aes(color = site)) +
+  theme_classic() +
+  theme(legend.position = "right", text = element_text(size = 12))
+
+# ggsave("CHANGE THIS PATH!/plasmid_composition_bydate.pdf", device = "pdf", width = 9, height = 5, units = "in")
+```
+
+# 6. Extra Questions
+
+Now that you've completed the workflow, you can try to answer the following questions:
+
+1. What variables are determining viral and phage diversity and community composition, apart from the location and the time?
+2. Do plasmid and viral diversity correlate?
+3. Do their community compositions vary together?
+4. What are the most abundant phages/plasmids? What is their length distribution?
+5. Do we see changes in phage/plasmid abundance associated with their length? (i.e. are shorter viruses more abundant?)

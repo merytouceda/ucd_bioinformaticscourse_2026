@@ -1,0 +1,411 @@
+---
+title: "Filtering Phage and Plasmid Output from geNomad"
+subtitle: "Day 3, Exercise 1 — UCD Bioinformatics Course"
+author: "Mery Touceda-Suarez"
+date: "June 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Overview and Steps Guide
+
+geNomad classifies sequences from a metagenome as viral, plasmid, or chromosomal, but its raw output is not meant to be used as-is — it includes low-confidence and low-quality calls that need to be filtered out before any downstream analysis. In this exercise you'll explore geNomad's summary output for both phages and plasmids, choose sensible filtering criteria based on that exploration, and then examine how sensitive your final dataset is to how strict or lenient those filters are.
+
+1. **Load libraries** — load `tidyverse`.
+2. **Phages: load and inspect** — read in the phage summary table and get an overview with `summary()`.
+3. **Phages: explore** — split viruses from proviruses, and look at the distribution of contig length and gene counts to decide on reasonable filtering thresholds.
+4. **Phages: filter** — apply a basic filter, then compare a stricter (AND) and more lenient (OR) version.
+5. **Plasmids: load and inspect** — same process as above, but for the plasmid summary table.
+6. **Plasmids: explore** — look at length, plasmid score, topology, and gene counts.
+7. **Plasmids: filter** — apply a basic filter on plasmid score, then a stricter and a more lenient version.
+8. **Quantify filter permissiveness** — rather than just eyeballing one filter at a time, build a summary table comparing all filters side by side, and sweep across a range of thresholds to see exactly where your dataset shrinks (for both phages and plasmids).
+9. **Interpret the plots** — use the explanatory notes throughout to understand what the histograms, scatterplots, and sweep curves are telling you about your filtering decisions.
+
+---
+
+# 1. Load Libraries
+
+```{r libraries}
+library(tidyverse)
+```
+
+# 2. Viruses (Phages)
+
+## 2.1 Load Data
+
+```{r load-phages}
+phage_inferences <- read_csv("~/Documents/GitHub/ucd_bioinformaticscourse_2026/data/phages_summary.csv")
+```
+
+## 2.2 Inspect Data
+
+```{r inspect-phages}
+summary(phage_inferences)
+```
+
+## 2.3 Explore
+
+We use this exploration to choose filter parameters. geNomad reports both free viruses and proviruses (viral sequences integrated into a bacterial host genome) in the same table, so it's worth exploring those separately, since they tend to have different length and gene-content profiles.
+
+```{r phage-type}
+phage_inferences <- phage_inferences %>%
+  mutate(type = case_when(str_detect(votu, "provirus") ~ "provirus",
+                           TRUE ~ "virus"))
+
+# How many of each type?
+dim(phage_inferences %>% filter(type == "provirus"))
+dim(phage_inferences %>% filter(type == "virus"))
+```
+
+Proviruses are integrated into a host genome, so one way to tell them apart is by looking at `host_genes`: proviruses should show non-zero host gene content, since they're embedded in (and were called alongside) a chunk of host sequence, while standalone viruses should not.
+
+```{r phage-host-genes}
+summary(phage_inferences %>% filter(type == "provirus") %>% select(host_genes))
+summary(phage_inferences %>% filter(type == "virus") %>% select(host_genes))
+```
+
+### Contig Length
+
+```{r phage-length}
+# all together
+hist(phage_inferences$contig_length)
+summary(phage_inferences$contig_length)
+
+# separated by type
+ggplot(phage_inferences, aes(y = contig_length)) +
+  geom_histogram() +
+  facet_wrap(~type)
+
+summary(phage_inferences %>% filter(type == "provirus") %>% select(contig_length))
+summary(phage_inferences %>% filter(type == "virus") %>% select(contig_length))
+```
+
+**Reading this plot:** the histogram shows you where most of your contigs fall in terms of length. A long right tail with a dense cluster near the minimum is common in metagenomic assemblies — many short, fragmented contigs and a smaller number of longer, more complete ones. Faceting by `type` lets you check whether proviruses and free viruses have systematically different length distributions, which would justify treating them differently when filtering rather than applying one blanket cutoff to both.
+
+Contamination and completeness are two other axes worth exploring before settling on filters, since a contig can be long but still low-quality if it's chimeric (contamination) or fragmented (low completeness):
+
+```{r phage-other-metrics}
+# 3.b contamination
+
+# 3.c completeness
+```
+
+## 2.4 Filter
+
+A reasonable first pass is to remove very short contigs, which are the most likely to be assembly fragments rather than real, complete viral genomes:
+
+```{r phage-filter-basic}
+# I will filter out viruses smaller than 5000bp
+phage_inferences_filtered <- phage_inferences %>%
+  filter(contig_length > 5000)
+
+# let's see how many we have left
+dim(phage_inferences_filtered)
+```
+
+You can tighten or loosen this filter depending on how conservative you want to be. Combining two criteria with a comma (or `&`) requires **both** to be true (stricter, fewer sequences kept); combining them with `|` requires **either** to be true (more lenient, more sequences kept):
+
+```{r phage-filter-strict-lenient}
+# We can be more strict, I want them also to have more than two viral genes
+phage_inferences_filtered_strict <- phage_inferences %>%
+  filter(contig_length > 5000, viral_genes > 2)
+
+# Or less strict, I want them to be >5000bp OR to have more than 2 viral genes
+phage_inferences_filtered_lenient <- phage_inferences %>%
+  filter(contig_length > 5000 | viral_genes > 2)
+```
+
+# 3. Plasmids
+
+Let's now look at the plasmids!
+
+## 3.1 Load Data
+
+```{r load-plasmids}
+plasmid_inferences <- read_csv("~/Documents/GitHub/ucd_bioinformaticscourse_2026/data/plasmids_summary.csv")
+```
+
+## 3.2 Inspect Data
+
+```{r inspect-plasmids}
+summary(plasmid_inferences)
+```
+
+## 3.3 Explore
+
+We use this exploration to choose filter parameters, the same way we did for phages.
+
+### Length
+
+```{r plasmid-length}
+hist(plasmid_inferences$length)
+summary(plasmid_inferences$length)
+```
+
+### Plasmid Score
+
+`plasmid_score` is geNomad's confidence score for plasmid classification, ranging from 0 to 1. It's typically the single most useful filtering variable for plasmids, since it directly reflects how confident geNomad is that a sequence is really a plasmid rather than a chromosomal fragment.
+
+```{r plasmid-score}
+hist(plasmid_inferences$plasmid_score)
+summary(plasmid_inferences$plasmid_score)
+```
+
+**Reading this histogram:** unlike contig length, `plasmid_score` is often heavily skewed toward 1, with most sequences classified with high confidence and a smaller tail of ambiguous calls closer to 0.5–0.8. That skew matters when you pick a threshold — small changes in the cutoff near the top of the distribution (e.g. 0.95 vs. 0.99) can still meaningfully change how many sequences you keep, even though they look like a "small" difference in score.
+
+### Topology
+
+```{r plasmid-topology}
+# How many of each topology?
+plasmid_inferences %>% count(topology)
+
+# length distribution separated by topology
+ggplot(plasmid_inferences, aes(x = length)) +
+  geom_histogram() +
+  facet_wrap(~topology)
+```
+
+Circular plasmids represent complete, closed sequences, while linear ones are often assembly fragments of larger circular plasmids that didn't fully resolve. If most of your short sequences are linear, that's a sign your length filter is also indirectly filtering out incomplete plasmids.
+
+### Number of Genes
+
+```{r plasmid-genes}
+hist(plasmid_inferences$n_genes)
+summary(plasmid_inferences$n_genes)
+```
+
+### Score vs. Length
+
+```{r plasmid-score-vs-length}
+ggplot(plasmid_inferences, aes(x = length, y = plasmid_score)) +
+  geom_point(alpha = 0.4) +
+  theme_classic()
+```
+
+**Reading this scatterplot:** this lets you check whether `plasmid_score` and `length` are giving you redundant or complementary information. If short sequences cluster at low scores, length and score are telling you roughly the same thing, and filtering on one largely covers the other. If you instead see short sequences with high scores (or long sequences with low scores), the two metrics are capturing different kinds of uncertainty, and combining them with an AND/OR filter (as below) becomes more meaningful.
+
+## 3.4 Filter
+
+```{r plasmid-filter-basic}
+# I will filter out plasmids with a low plasmid_score
+plasmid_inferences_filtered <- plasmid_inferences %>%
+  filter(plasmid_score > 0.8)
+
+# let's see how many we have left
+dim(plasmid_inferences_filtered)
+```
+
+```{r plasmid-filter-strict-lenient}
+# We can be more strict: score AND a minimum length
+plasmid_inferences_filtered_strict <- plasmid_inferences %>%
+  filter(plasmid_score > 0.8, length > 1000)
+
+# Or less strict: score OR a minimum length
+plasmid_inferences_filtered_lenient <- plasmid_inferences %>%
+  filter(plasmid_score > 0.8 | length > 1000)
+```
+
+# 4. Quantifying Filter Permissiveness
+
+So far we've applied a handful of filters one at a time and looked at how many sequences survived each one with `dim()`. That tells you the result of a single choice, but not how sensitive that result is to the choice itself. In this section we systematically compare filters side by side, and sweep across a *range* of thresholds, so you can see exactly where your dataset is robust to the cutoff you choose and where it's fragile (i.e. where small changes in threshold cause big swings in how many sequences you keep).
+
+A quick technical note before we start: some geNomad output columns can contain a stray missing value (`NA`), and functions like `sum()` will propagate that single `NA` across an entire calculation unless you tell them to ignore it. That's why you'll see `na.rm = TRUE` used throughout below — without it, a single missing value can silently turn your whole result into `NA`, which can look like a bug in your code when it's really just an unhandled missing value in the data.
+
+## 4.1 Phages
+
+### Comparing Named Filters Side by Side
+
+```{r phage-filter-comparison}
+phage_filters <- list(
+  "no filter"          = function(df) df,
+  "length > 5000"      = function(df) filter(df, contig_length > 5000),
+  "strict (AND)"       = function(df) filter(df, contig_length > 5000, viral_genes > 2),
+  "lenient (OR)"       = function(df) filter(df, contig_length > 5000 | viral_genes > 2)
+)
+
+phage_filter_summary <- map_dfr(names(phage_filters), function(filter_name) {
+  filtered <- phage_filters[[filter_name]](phage_inferences)
+  tibble(
+    filter = filter_name,
+    n_retained = nrow(filtered),
+    pct_retained = round(100 * nrow(filtered) / nrow(phage_inferences), 1)
+  )
+})
+
+phage_filter_summary
+```
+
+**Reading this table:** this puts all your filtering decisions in one place so you can compare percentage retained at a glance, rather than re-running `dim()` after each filter and trying to remember the previous number.
+
+### Threshold Sweep: Contig Length
+
+```{r phage-length-sweep}
+length_thresholds <- seq(1000, 10000, by = 500)
+
+phage_length_sweep <- map_dfr(length_thresholds, function(thresh) {
+  tibble(
+    threshold = thresh,
+    n_retained = sum(phage_inferences$contig_length > thresh, na.rm = TRUE)
+  )
+})
+
+ggplot(phage_length_sweep, aes(x = threshold, y = n_retained)) +
+  geom_line() +
+  geom_point() +
+  xlab("Minimum contig length (bp)") +
+  ylab("Number of viral contigs retained") +
+  ggtitle("Effect of contig length cutoff on retained phages") +
+  theme_classic()
+```
+
+**Reading this plot:** a steep drop in the curve tells you that many contigs cluster right around that length, so your final count is very sensitive to where exactly you set the cutoff there. A flatter stretch of the curve means the choice of cutoff matters less in that range, since few sequences sit right at the boundary. Look for a "knee" in the curve — a flatter region after an initial steep drop is often a good place to set a defensible threshold, since it means you're not sitting on a knife-edge decision.
+
+### Threshold Sweep: Viral Gene Count
+
+```{r phage-gene-sweep}
+gene_thresholds <- seq(0, 10, by = 1)
+
+phage_gene_sweep <- map_dfr(gene_thresholds, function(thresh) {
+  tibble(
+    threshold = thresh,
+    n_retained = sum(phage_inferences$viral_genes > thresh, na.rm = TRUE)
+  )
+})
+
+ggplot(phage_gene_sweep, aes(x = threshold, y = n_retained)) +
+  geom_line() +
+  geom_point() +
+  xlab("Minimum number of viral genes") +
+  ylab("Number of viral contigs retained") +
+  ggtitle("Effect of viral gene count cutoff on retained phages") +
+  theme_classic()
+```
+
+### Combined Sweep: AND vs. OR Logic
+
+```{r phage-combined-sweep}
+phage_combined_sweep <- map_dfr(length_thresholds, function(thresh) {
+  tibble(
+    threshold = thresh,
+    n_AND = sum(phage_inferences$contig_length > thresh & phage_inferences$viral_genes > 2, na.rm = TRUE),
+    n_OR  = sum(phage_inferences$contig_length > thresh | phage_inferences$viral_genes > 2, na.rm = TRUE)
+  )
+}) %>%
+  pivot_longer(cols = c(n_AND, n_OR), names_to = "logic", values_to = "n_retained")
+
+ggplot(phage_combined_sweep, aes(x = threshold, y = n_retained, color = logic)) +
+  geom_line() +
+  geom_point() +
+  xlab("Minimum contig length (bp)") +
+  ylab("Number of viral contigs retained") +
+  ggtitle("AND vs OR filtering across length thresholds") +
+  theme_classic()
+```
+
+**Reading this plot:** the gap between the AND and OR lines tells you how much your combination logic matters, independent of the threshold itself. A wide gap means the two criteria (length and gene count) are capturing different sequences, so whether you require both or either makes a real difference to your final dataset. A narrow gap means the two criteria are largely redundant — most sequences that pass one also pass the other, so the AND/OR choice barely matters and you could simplify your filter to a single criterion.
+
+## 4.2 Plasmids
+
+### Comparing Named Filters Side by Side
+
+```{r plasmid-filter-comparison}
+plasmid_filters <- list(
+  "no filter"    = function(df) df,
+  "score > 0.8"  = function(df) filter(df, plasmid_score > 0.8),
+  "strict (AND)" = function(df) filter(df, plasmid_score > 0.8, length > 1000),
+  "lenient (OR)" = function(df) filter(df, plasmid_score > 0.8 | length > 1000)
+)
+
+plasmid_filter_summary <- map_dfr(names(plasmid_filters), function(filter_name) {
+  filtered <- plasmid_filters[[filter_name]](plasmid_inferences)
+  tibble(
+    filter = filter_name,
+    n_retained = nrow(filtered),
+    pct_retained = round(100 * nrow(filtered) / nrow(plasmid_inferences), 1)
+  )
+})
+
+plasmid_filter_summary
+```
+
+### Threshold Sweep: Plasmid Score
+
+```{r plasmid-score-sweep}
+score_thresholds <- seq(0.5, 0.95, by = 0.05)
+
+plasmid_score_sweep <- map_dfr(score_thresholds, function(thresh) {
+  tibble(
+    threshold = thresh,
+    n_retained = sum(plasmid_inferences$plasmid_score > thresh, na.rm = TRUE)
+  )
+})
+
+ggplot(plasmid_score_sweep, aes(x = threshold, y = n_retained)) +
+  geom_line() +
+  geom_point() +
+  xlab("Minimum plasmid score") +
+  ylab("Number of plasmids retained") +
+  ggtitle("Effect of plasmid score cutoff on retained plasmids") +
+  theme_classic()
+```
+
+**Reading this plot:** since `plasmid_score` tends to be heavily skewed toward 1, you may find that this curve stays nearly flat for most of the threshold range and only starts dropping sharply near the very top (e.g. above 0.95). That's expected — it means most of your plasmids are called with very high confidence, and the only real decision you're making is how to treat the small minority of lower-confidence calls.
+
+### Threshold Sweep: Length
+
+```{r plasmid-length-sweep}
+plasmid_length_thresholds <- seq(500, 10000, by = 500)
+
+plasmid_length_sweep <- map_dfr(plasmid_length_thresholds, function(thresh) {
+  tibble(
+    threshold = thresh,
+    n_retained = sum(plasmid_inferences$length > thresh, na.rm = TRUE)
+  )
+})
+
+ggplot(plasmid_length_sweep, aes(x = threshold, y = n_retained)) +
+  geom_line() +
+  geom_point() +
+  xlab("Minimum plasmid length (bp)") +
+  ylab("Number of plasmids retained") +
+  ggtitle("Effect of length cutoff on retained plasmids") +
+  theme_classic()
+```
+
+### Combined Sweep: AND vs. OR Logic
+
+```{r plasmid-combined-sweep}
+plasmid_combined_sweep <- map_dfr(score_thresholds, function(thresh) {
+  tibble(
+    threshold = thresh,
+    n_AND = sum(plasmid_inferences$plasmid_score > thresh & plasmid_inferences$length > 1000, na.rm = TRUE),
+    n_OR  = sum(plasmid_inferences$plasmid_score > thresh | plasmid_inferences$length > 1000, na.rm = TRUE)
+  )
+}) %>%
+  pivot_longer(cols = c(n_AND, n_OR), names_to = "logic", values_to = "n_retained")
+
+ggplot(plasmid_combined_sweep, aes(x = threshold, y = n_retained, color = logic)) +
+  geom_line() +
+  geom_point() +
+  xlab("Minimum plasmid score") +
+  ylab("Number of plasmids retained") +
+  ggtitle("AND vs OR filtering across score thresholds") +
+  theme_classic()
+```
+
+# 5. Wrap-Up Discussion
+
+After working through both sections, discuss with your group:
+
+1. For phages, does length or gene count seem like the more "decisive" filtering variable — i.e. which one, when swept across thresholds, causes bigger swings in how many sequences are retained?
+2. For plasmids, where does the `plasmid_score` sweep start to drop off steeply? Does that match where you'd intuitively want to draw the line between "confident" and "uncertain" calls?
+3. Looking at the AND vs. OR plots for both groups: are your two filtering criteria mostly redundant, or do they capture meaningfully different sequences?
+4. Based on everything above, what filtering thresholds would you choose for your own analysis, and how would you justify that choice to someone reviewing your work?
