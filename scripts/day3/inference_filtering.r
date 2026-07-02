@@ -46,15 +46,90 @@ summary(phage_inferences$contig_length)
 # separated by type
 ggplot(phage_inferences, aes(y = contig_length))+
   geom_histogram()+
-  facet_wrap(~type)
+  facet_wrap(~type, scale = "free")+
+  coord_flip()
+
+# hard to see, let's look separately
+phage_inferences %>% filter(type == "provirus") %>%
+  ggplot(aes(y = contig_length))+
+  geom_histogram()+
+  coord_flip()
+
+phage_inferences %>% filter(!type == "provirus") %>%
+  ggplot(aes(y = contig_length))+
+  geom_histogram()+
+  coord_flip()
+
 
 summary(phage_inferences %>% filter(type == "provirus") %>% select(contig_length))
 summary(phage_inferences %>% filter(type == "virus") %>% select(contig_length))
 
 
 # 3.b contamination 
+hist(phage_inferences$completeness)
+summary(phage_inferences$completeness)
+
+# separated by type
+ggplot(phage_inferences, aes(y = completeness))+
+  geom_histogram()+
+  facet_wrap(~type, scale = "free")+
+  coord_flip()
+
 
 # 3.c completeness
+hist(phage_inferences$contamination)
+summary(phage_inferences$contamination)
+
+# separated by type
+ggplot(phage_inferences, aes(y = contamination))+
+  geom_histogram()+
+  facet_wrap(~type, scale = "free")+
+  coord_flip()
+
+# There is a virus with contamination > 90%, who is it?
+highly_contamined <- phage_inferences %>%
+  filter(contamination > 90) 
+
+highly_contamined %>%
+  count()
+# There are actually 66
+
+highly_contamined %>%
+  count(type)
+# they are all proviruses (makes sense)!
+
+highly_contamined %>%
+  count(host_genes, viral_genes)
+#host_genes viral_genes     n
+#        <dbl>       <dbl> <int>
+#1          1           1    28
+#2          2           1    20
+#3          2           2     3
+#4          3           1     4
+#5          4           1     8
+#6          5           1     2
+#7          6           1     1
+
+
+# 3.d number of viral and host genes
+
+# how many contigs have a host gene?
+phage_inferences %>%
+  filter(host_genes > 0) %>%
+  count()
+
+# how many of those have no viral gene
+phage_inferences %>%
+  filter(host_genes > 0) %>%
+  filter(viral_genes == 0) %>%
+  count()
+
+# none! yay! those would be the ones we would want to remove
+
+# how many have more host genes than viral genes (not necessaily want to remove but curious)
+phage_inferences %>%
+  filter(host_genes > viral_genes) %>%
+  count()
 
 
 
