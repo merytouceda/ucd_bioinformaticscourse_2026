@@ -7,18 +7,18 @@ library(DESeq2)
 library(tidyverse)
 library(pheatmap)
 
-setwd("~/Documents/GitHub/ucd_bioinformaticscourse_2026/scripts/day4/DESeq2/")
+setwd("~/Documents/GitHub/ucd_bioinformaticscourse_2026/scripts/day4/DESeq2_exercise/")
 
 # ==============================
 # READ IN DATA
 # ==============================
 # Read in gene matrix
-Gene_matrix <- read.table("Gene_matrix.txt", sep="\t", header=TRUE)
+Gene_matrix <- read.table("../../data/Gene_matrix.txt", sep="\t", header=TRUE)
 dim(Gene_matrix)
 #[1] 28524     9
 
 # Read in pheno data
-pheno_data <- read.table("Metadata.txt", sep="\t", header=TRUE) %>%
+pheno_data <- read.table("../../data/metadata_day4.txt", sep="\t", header=TRUE) %>%
   mutate(Day = factor(Day)) %>%
   column_to_rownames("Sample_ID") %>%
   mutate(Sample_ID = rownames(.))
